@@ -67,7 +67,7 @@
  *  https://github.com/apngasm/apngasm
 
 
- /* APNG Optimizer 1.4
+ * APNG Optimizer 1.4
  *
  * Makes APNG files smaller.
  *
@@ -181,8 +181,6 @@ PngDecoder::PngDecoder()
 {
     m_signature = "\x89\x50\x4e\x47\xd\xa\x1a\xa";
     m_color_type = 0;
-    m_png_ptr = 0;
-    m_info_ptr = m_end_info = 0;
     m_f = 0;
     m_buf_supported = true;
     m_buf_pos = 0;
@@ -203,16 +201,7 @@ PngDecoder::~PngDecoder()
     if( m_f )
     {
         fclose( m_f );
-        m_f = 0;
-    }
-
-    if( m_png_ptr )
-    {
-        png_structp png_ptr = (png_structp)m_png_ptr;
-        png_infop info_ptr = (png_infop)m_info_ptr;
-        png_infop end_info = (png_infop)m_end_info;
-        png_destroy_read_struct( &png_ptr, &info_ptr, &end_info );
-        m_png_ptr = m_info_ptr = m_end_info = 0;
+        m_f = nullptr;
     }
 }
 
@@ -240,145 +229,158 @@ bool  PngDecoder::readHeader()
 {
     volatile bool result = false;
 
-    png_structp png_ptr = png_create_read_struct( PNG_LIBPNG_VER_STRING, 0, 0, 0 );
+    PngPtrs png_ptrs;
+    png_structp png_ptr = png_ptrs.getPng();
+    png_infop info_ptr = png_ptrs.getInfo();
+    png_infop end_info = png_ptrs.getEndInfo();
 
-    if( png_ptr )
+    if( png_ptr && info_ptr && end_info )
     {
-        png_infop info_ptr = png_create_info_struct( png_ptr );
-        png_infop end_info = png_create_info_struct( png_ptr );
-
-        m_png_ptr = png_ptr;
-        m_info_ptr = info_ptr;
-        m_end_info = end_info;
         m_buf_pos = 0;
-
-        if( info_ptr && end_info )
+        if( setjmp( png_jmpbuf( png_ptr ) ) == 0 )
         {
-            if( setjmp( png_jmpbuf( png_ptr ) ) == 0 )
+            unsigned char sig[8];
+            uint32_t id = 0;
+            Chunk chunk;
+
+            if( !m_buf.empty() )
+                png_set_read_fn(png_ptr, this, (png_rw_ptr)readDataFromBuf );
+            else
             {
-                unsigned char sig[8];
-                uint32_t id = 0;
-                Chunk chunk;
-
-                if( !m_buf.empty() )
-                    png_set_read_fn(png_ptr, this, (png_rw_ptr)readDataFromBuf );
-                else
+                m_f = fopen(m_filename.c_str(), "rb");
+                if (!m_f)
                 {
-                    m_f = fopen(m_filename.c_str(), "rb");
-                    if (!m_f)
-                        return false;
-                    png_init_io(png_ptr, m_f);
-
-                    if (fread(sig, 1, 8, m_f))
-                        id = read_chunk(m_chunkIHDR);
-                }
-
-                if (id != id_IHDR)
-                {
-                    read_from_io(&sig, 8, 1);
-                    id = read_chunk(m_chunkIHDR);
-                }
-
-                if (!(id == id_IHDR && m_chunkIHDR.p.size() == 25))
                     return false;
+                }
+                png_init_io(png_ptr, m_f);
+            }
 
-                while (true)
+            // Read PNG header: 137 80 78 71 13 10 26 10
+            if (!read_from_io(&sig, 8))
+                return false;
+
+            id = read_chunk(m_chunkIHDR);
+            // 8=HDR+size, 13=size of IHDR chunk, 4=CRC
+            // http://www.libpng.org/pub/png/spec/1.2/PNG-Chunks.html#C.IHDR
+            if (!(id == id_IHDR && m_chunkIHDR.p.size() == 8 + 13 + 4))
+            {
+                return false;
+            }
+
+            while (true)
+            {
+                m_is_fcTL_loaded = false;
+                id = read_chunk(chunk);
+
+                if (!id || (m_f && feof(m_f)) || (!m_buf.empty() && m_buf_pos > m_buf.total()))
                 {
-                    m_is_fcTL_loaded = false;
-                    id = read_chunk(chunk);
+                    return false;
+                }
 
-                    if ((m_f && feof(m_f)) || (!m_buf.empty() && m_buf_pos > m_buf.total()))
+                if (id == id_IDAT)
+                {
+                    if (m_f)
+                        fseek(m_f, 0, SEEK_SET);
+                    else
+                        m_buf_pos = 0;
+                    break;
+                }
+
+                if (id == id_acTL)
+                {
+                    // 8=HDR+size, 8=size of acTL chunk, 4=CRC
+                    // https://wiki.mozilla.org/APNG_Specification#%60acTL%60:_The_Animation_Control_Chunk
+                    if (chunk.p.size() != 8 + 8 + 4)
                         return false;
+                    m_animation.loop_count = png_get_uint_32(&chunk.p[12]);
 
-                    if (id == id_IDAT)
-                    {
-                        if (m_f)
-                            fseek(m_f, 0, SEEK_SET);
-                        else
-                            m_buf_pos = 0;
-                        break;
-                    }
-
-                    if (id == id_acTL && chunk.p.size() == 20)
-                    {
-                        m_animation.loop_count = png_get_uint_32(&chunk.p[12]);
-
-                        if (chunk.p[8] > 0)
-                        {
-                            chunk.p[8] = 0;
-                            chunk.p[9] = 0;
-                            m_frame_count = png_get_uint_32(&chunk.p[8]);
-                            m_frame_count++;
-                        }
-                        else
-                            m_frame_count = png_get_uint_32(&chunk.p[8]);
-                    }
-
-                    if (id == id_fcTL)
-                    {
-                        m_is_fcTL_loaded = true;
-                        w0 = png_get_uint_32(&chunk.p[12]);
-                        h0 = png_get_uint_32(&chunk.p[16]);
-                        x0 = png_get_uint_32(&chunk.p[20]);
-                        y0 = png_get_uint_32(&chunk.p[24]);
-                        delay_num = png_get_uint_16(&chunk.p[28]);
-                        delay_den = png_get_uint_16(&chunk.p[30]);
-                        dop = chunk.p[32];
-                        bop = chunk.p[33];
-                    }
-
-                    if (id == id_bKGD)
-                    {
-                        int bgcolor = png_get_uint_32(&chunk.p[8]);
-                        m_animation.bgcolor[3] = (bgcolor >> 24) & 0xFF;
-                        m_animation.bgcolor[2] = (bgcolor >> 16) & 0xFF;
-                        m_animation.bgcolor[1] = (bgcolor >> 8) & 0xFF;
-                        m_animation.bgcolor[0] = bgcolor & 0xFF;
-                    }
-
-                    if (id == id_PLTE || id == id_tRNS)
-                        m_chunksInfo.push_back(chunk);
+                    m_frame_count = png_get_uint_32(&chunk.p[8]);
+                    if (m_frame_count == 0)
+                        return false;
                 }
 
-                png_uint_32 wdth, hght;
-                int bit_depth, color_type, num_trans=0;
-                png_bytep trans;
-                png_color_16p trans_values;
-
-                png_read_info( png_ptr, info_ptr );
-                png_get_IHDR(png_ptr, info_ptr, &wdth, &hght,
-                    &bit_depth, &color_type, 0, 0, 0);
-
-                m_width = (int)wdth;
-                m_height = (int)hght;
-                m_color_type = color_type;
-                m_bit_depth = bit_depth;
-
-                if (bit_depth <= 8 || bit_depth == 16)
+                if (id == id_fcTL)
                 {
-                    switch (color_type)
-                    {
-                    case PNG_COLOR_TYPE_RGB:
-                    case PNG_COLOR_TYPE_PALETTE:
-                        png_get_tRNS(png_ptr, info_ptr, &trans, &num_trans, &trans_values);
-                        if (num_trans > 0)
-                            m_type = CV_8UC4;
-                        else
-                            m_type = CV_8UC3;
-                        break;
-                    case PNG_COLOR_TYPE_GRAY_ALPHA:
-                    case PNG_COLOR_TYPE_RGB_ALPHA:
-                        m_type = CV_8UC4;
-                        break;
-                    default:
-                        m_type = CV_8UC1;
-                    }
-                    if (bit_depth == 16)
-                        m_type = CV_MAKETYPE(CV_16U, CV_MAT_CN(m_type));
-                    result = true;
+                    // 8=HDR+size, 26=size of fcTL chunk, 4=CRC
+                    // https://wiki.mozilla.org/APNG_Specification#%60fcTL%60:_The_Frame_Control_Chunk
+                    if (chunk.p.size() != 8 + 26 + 4)
+                        return false;
+                    m_is_fcTL_loaded = true;
+                    w0 = png_get_uint_32(&chunk.p[12]);
+                    h0 = png_get_uint_32(&chunk.p[16]);
+                    x0 = png_get_uint_32(&chunk.p[20]);
+                    y0 = png_get_uint_32(&chunk.p[24]);
+                    delay_num = png_get_uint_16(&chunk.p[28]);
+                    delay_den = png_get_uint_16(&chunk.p[30]);
+                    dop = chunk.p[32];
+                    bop = chunk.p[33];
                 }
+
+                if (id == id_bKGD)
+                {
+                    // 8=HDR+size, ??=size of bKGD chunk, 4=CRC
+                    // The spec is actually more complex: http://www.libpng.org/pub/png/spec/1.2/PNG-Chunks.html#C.bKGD
+                    // TODO: we only check that 4 bytes can be read from &chunk.p[8]. Fix.
+                    if (chunk.p.size() < 8 + 4)
+                        return false;
+                    int bgcolor = png_get_uint_32(&chunk.p[8]);
+                    m_animation.bgcolor[3] = (bgcolor >> 24) & 0xFF;
+                    m_animation.bgcolor[2] = (bgcolor >> 16) & 0xFF;
+                    m_animation.bgcolor[1] = (bgcolor >> 8) & 0xFF;
+                    m_animation.bgcolor[0] = bgcolor & 0xFF;
+                }
+
+                if (id == id_PLTE || id == id_tRNS)
+                    m_chunksInfo.push_back(chunk);
+            }
+
+            png_uint_32 wdth, hght;
+            int bit_depth, color_type, num_trans=0;
+            png_bytep trans;
+            png_color_16p trans_values;
+
+            // Free chunk in case png_read_info uses longjmp.
+            chunk.p.clear();
+            chunk.p.shrink_to_fit();
+
+            png_read_info( png_ptr, info_ptr );
+            png_get_IHDR(png_ptr, info_ptr, &wdth, &hght,
+                &bit_depth, &color_type, 0, 0, 0);
+
+            m_width = (int)wdth;
+            m_height = (int)hght;
+            m_color_type = color_type;
+            m_bit_depth = bit_depth;
+
+            if (bit_depth <= 8 || bit_depth == 16)
+            {
+                switch (color_type)
+                {
+                case PNG_COLOR_TYPE_RGB:
+                case PNG_COLOR_TYPE_PALETTE:
+                    png_get_tRNS(png_ptr, info_ptr, &trans, &num_trans, &trans_values);
+                    if (num_trans > 0)
+                        m_type = CV_8UC4;
+                    else
+                        m_type = CV_8UC3;
+                    break;
+                case PNG_COLOR_TYPE_GRAY_ALPHA:
+                case PNG_COLOR_TYPE_RGB_ALPHA:
+                    m_type = CV_8UC4;
+                    break;
+                default:
+                    m_type = CV_8UC1;
+                }
+                if (bit_depth == 16)
+                    m_type = CV_MAKETYPE(CV_16U, CV_MAT_CN(m_type));
+                result = true;
             }
         }
+    }
+
+    if(result)
+    {
+        m_png_ptrs = std::move(png_ptrs);
     }
 
     return result;
@@ -404,7 +406,6 @@ bool  PngDecoder::readData( Mat& img )
                 fseek(m_f, -8, SEEK_CUR);
             else
                 m_buf_pos -= 8;
-
         }
         else
             m_mat_next.copyTo(mat_cur);
@@ -412,8 +413,8 @@ bool  PngDecoder::readData( Mat& img )
         frameCur.setMat(mat_cur);
 
         processing_start((void*)&frameRaw, mat_cur);
-        png_structp png_ptr = (png_structp)m_png_ptr;
-        png_infop info_ptr = (png_infop)m_info_ptr;
+        png_structp png_ptr = m_png_ptrs.getPng();
+        png_infop info_ptr = m_png_ptrs.getInfo();
 
         while (true)
         {
@@ -437,9 +438,9 @@ bool  PngDecoder::readData( Mat& img )
                         memcpy(frameNext.getPixels(), frameCur.getPixels(), imagesize);
 
                     compose_frame(frameCur.getRows(), frameRaw.getRows(), bop, x0, y0, w0, h0, mat_cur);
-                    if (delay_den < 1000)
-                        delay_num = cvRound(1000.0 / delay_den);
-                    m_animation.durations.push_back(delay_num);
+                    if (!delay_den)
+                        delay_den = 100;
+                    m_animation.durations.push_back(cvRound(1000.*delay_num/delay_den));
 
                     if (mat_cur.channels() == img.channels())
                         mat_cur.copyTo(img);
@@ -495,9 +496,9 @@ bool  PngDecoder::readData( Mat& img )
                 if (processing_finish())
                 {
                     compose_frame(frameCur.getRows(), frameRaw.getRows(), bop, x0, y0, w0, h0, mat_cur);
-                    if (delay_den < 1000)
-                        delay_num = cvRound(1000.0 / delay_den);
-                    m_animation.durations.push_back(delay_num);
+                    if (!delay_den)
+                        delay_den = 100;
+                    m_animation.durations.push_back(cvRound(1000.*delay_num/delay_den));
 
                     if (mat_cur.channels() == img.channels())
                         mat_cur.copyTo(img);
@@ -522,11 +523,11 @@ bool  PngDecoder::readData( Mat& img )
     unsigned char** buffer = _buffer.data();
     bool color = img.channels() > 1;
 
-    png_structp png_ptr = (png_structp)m_png_ptr;
-    png_infop info_ptr = (png_infop)m_info_ptr;
-    png_infop end_info = (png_infop)m_end_info;
+    png_structp png_ptr = m_png_ptrs.getPng();
+    png_infop info_ptr = m_png_ptrs.getInfo();
+    png_infop end_info = m_png_ptrs.getEndInfo();
 
-    if( m_png_ptr && m_info_ptr && m_end_info && m_width && m_height )
+    if( png_ptr && info_ptr && end_info && m_width && m_height )
     {
         if( setjmp( png_jmpbuf ( png_ptr ) ) == 0 )
         {
@@ -682,32 +683,35 @@ void PngDecoder::compose_frame(std::vector<png_bytep>& rows_dst, const std::vect
             });
 }
 
-size_t PngDecoder::read_from_io(void* _Buffer, size_t _ElementSize, size_t _ElementCount)
+bool PngDecoder::read_from_io(void* buffer, size_t num_bytes)
 {
     if (m_f)
-        return fread(_Buffer, _ElementSize, _ElementCount, m_f);
+        return fread(buffer, 1, num_bytes, m_f) == num_bytes;
 
-    if (m_buf_pos + _ElementSize > m_buf.cols * m_buf.rows * m_buf.elemSize())
-        CV_Error(Error::StsInternal, "PNG input buffer is incomplete");
+    if (m_buf_pos + num_bytes > m_buf.cols * m_buf.rows * m_buf.elemSize()) {
+        CV_LOG_WARNING(NULL, "PNG input buffer is incomplete");
+        return false;
+    }
 
-    memcpy( _Buffer, m_buf.ptr() + m_buf_pos, _ElementSize );
-    m_buf_pos += _ElementSize;
-    return 1;
+    memcpy( buffer, m_buf.ptr() + m_buf_pos, num_bytes );
+    m_buf_pos += num_bytes;
+    return true;
 }
 
 uint32_t PngDecoder::read_chunk(Chunk& chunk)
 {
     unsigned char len[4];
-    if (read_from_io(&len, 4, 1) == 1)
+    if (read_from_io(&len, 4))
     {
-        const size_t size = png_get_uint_32(len) + 12;
+        const size_t size = static_cast<size_t>(png_get_uint_32(len)) + 12;
         if (size > PNG_USER_CHUNK_MALLOC_MAX)
         {
             CV_LOG_WARNING(NULL, "chunk data is too large");
+            return 0;
         }
         chunk.p.resize(size);
         memcpy(chunk.p.data(), len, 4);
-        if (read_from_io(&chunk.p[4], chunk.p.size() - 4, 1) == 1)
+        if (read_from_io(&chunk.p[4], chunk.p.size() - 4))
             return *(uint32_t*)(&chunk.p[4]);
     }
     return 0;
@@ -717,21 +721,20 @@ bool PngDecoder::processing_start(void* frame_ptr, const Mat& img)
 {
     static uint8_t header[8] = { 137, 80, 78, 71, 13, 10, 26, 10 };
 
-    png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-    png_infop info_ptr = png_create_info_struct(png_ptr);
+    PngPtrs png_ptrs;
+    png_structp png_ptr = png_ptrs.getPng();
+    png_infop info_ptr = png_ptrs.getInfo();
 
-    m_png_ptr = png_ptr;
-    m_info_ptr = info_ptr;
-
-    if (!png_ptr || !info_ptr)
-        return false;
-
-    if (setjmp(png_jmpbuf(png_ptr)))
-    {
-        png_destroy_read_struct(&png_ptr, &info_ptr, 0);
+    if (!png_ptr || !info_ptr) {
         return false;
     }
 
+    if (setjmp(png_jmpbuf(png_ptr)))
+    {
+        return false;
+    }
+
+    m_png_ptrs = std::move(png_ptrs);
     png_set_crc_action(png_ptr, PNG_CRC_QUIET_USE, PNG_CRC_QUIET_USE);
     png_set_progressive_read_fn(png_ptr, frame_ptr, (png_progressive_info_ptr)info_fn, row_fn, NULL);
 
@@ -760,21 +763,23 @@ bool PngDecoder::processing_finish()
 {
     static uint8_t footer[12] = { 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130 };
 
-    png_structp png_ptr = (png_structp)m_png_ptr;
-    png_infop info_ptr = (png_infop)m_info_ptr;
+    png_structp png_ptr = m_png_ptrs.getPng();
+    png_infop info_ptr = m_png_ptrs.getInfo();
 
-    if (!png_ptr || !info_ptr)
+    if (!png_ptr) {
+        m_png_ptrs.clear();
         return false;
+    }
 
     if (setjmp(png_jmpbuf(png_ptr)))
     {
-        png_destroy_read_struct(&png_ptr, &info_ptr, 0);
+        m_png_ptrs.clear();
         return false;
     }
 
     png_process_data(png_ptr, info_ptr, footer, 12);
-    png_destroy_read_struct(&png_ptr, &info_ptr, 0);
-    m_png_ptr = 0;
+    m_png_ptrs.clear();
+
     return true;
 }
 
